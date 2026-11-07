@@ -1,10 +1,12 @@
 import {createAppAuth} from '@octokit/auth-app'
-import { readFileSync } from 'node:fs'
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager'
 import { json } from 'zod';
 
+const sm = new SecretsManagerClient({region: 'us-east-2'});
+const { SecretString: privateKey } = await sm.send(new GetSecretValueCommand({ SecretId: "mvp-tracker/github-app-key"}))
 const auth = createAppAuth({
     appId: process.env.GITHUB_APP_CLIENT_ID!,
-    privateKey: readFileSync(process.env.GITHUB_APP_PRIVATE_KEY_PATH!, 'utf8'),
+    privateKey: privateKey!,
 })
  
 export async function getMVP(): Promise<string | null> {
