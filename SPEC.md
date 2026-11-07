@@ -1,18 +1,18 @@
 # mvp-tracker spec
 
-A page that compares `MVP.md` with your code and shows the tasks left on a timeline, built to learn Lambda, EC2 and RDS.
+A page that compares `MVP.md` with your code and shows the tasks left on a timeline, built to learn EC2, RDS, S3 and CloudFront.
 
 ## Problem Statement
 
 I start projects without set deadlines, done criteria, or an attainable MVP. Stride, for example, had task tracking but no MVP, and I burned out on endless UX improvements because nothing defined "good enough". GitHub's milestones and roadmap can hold dates, but they only know what I type into them, so they can't tell me what my code still lacks.
 
-I also want to learn AWS by building something real. I can't yet deploy a Lambda, host a page on EC2, or store data in RDS.
+I also want to learn AWS by building something real. I can't yet run a server on EC2, store data in RDS, or host a site on S3 and CloudFront.
 
 ## Solution
 
 I write an `MVP.md` in a repo, listing deliverables with a deadline and done criteria for each. I sign in with GitHub and open a page showing those deliverables on a timeline. The page refreshes the plan from `MVP.md` on every reload, before any comparison has run. When I press "Compare with code", an LLM compares `MVP.md` with the repo's code and lists the tasks left, grouped by deliverable and tied to done criteria. Results are saved, so they're still there when I come back.
 
-The system runs on Lambda, EC2, and RDS, which is the main reason for building it. A cheaper stack may be possible, but learning these services is the goal.
+The React frontend is served from S3 through CloudFront, the API runs on EC2, and data is stored in RDS. Learning these services is the main reason for building it, so a cheaper stack isn't the goal.
 
 ## User Stories
 
@@ -60,8 +60,8 @@ The system runs on Lambda, EC2, and RDS, which is the main reason for building i
 
 **Learning AWS**
 
-31. As the user, I want to deploy a Lambda that calls the GitHub API, so that I learn how Lambda works with an outside API.
-32. As the user, I want to host the page on EC2, so that I learn how to run a server on AWS.
+31. As the user, I want to serve the React frontend from S3 through CloudFront, so that I learn the standard way to host a static site on AWS.
+32. As the user, I want to run the API on EC2, so that I learn how to run a server on AWS.
 33. As the user, I want to store repo data and results in RDS, so that I learn how to run a database on AWS.
 34. As the user, I want billing alerts in place from the start, so that a mistake doesn't turn into a surprise bill.
 
@@ -79,9 +79,37 @@ The system runs on Lambda, EC2, and RDS, which is the main reason for building i
 
 ## Implementation Decisions
 
+**Architecture**
+
+```
+Browser ──HTTPS──▶ CloudFront (your domain, free HTTPS certificate)
+                     ├─ /*      ──▶ S3 (built React files, private bucket)
+                     └─ /api/*  ──▶ EC2 (Fastify API)
+
+┌──────────────────────── VPC ─────────────────────────────┐
+│  Public subnet:   EC2 ──▶ internet gateway ──▶ GitHub, LLM │
+│                    │                                       │
+│  Private subnet:  RDS ◀── only EC2 can connect             │
+└───────────────────────────────────────────────────────────┘
+```
+
+- **CloudFront:** serves the site on my domain over HTTPS. It sends `/api/*` to EC2 and everything else to S3, so the page and API share one domain and sign-in cookies work without cross-origin setup. It never caches `/api/*`, and gives `index.html` a short cache time so new deployments show straight away.
+- **S3:** a private bucket holding the built React app, readable only through CloudFront.
+- **EC2:** runs the Fastify API in a public subnet. It reaches GitHub and the LLM through the VPC's internet gateway, so no NAT gateway is needed. Its security group accepts API traffic only from CloudFront, using AWS's managed CloudFront prefix list. It holds the GitHub App's private key, handles sign-in, reads `MVP.md` on reload, runs comparisons, and is the only thing that talks to RDS.
+- **RDS:** Postgres in a private subnet of the same VPC. Its security group accepts connections only from EC2's security group.
+- **Secrets:** the GitHub App's private key and the LLM API key are stored in AWS Secrets Manager, and EC2 reads them through its IAM role. They're never committed.
+
+**Stack**
+
+- TypeScript throughout, run with Bun.
+- **Frontend:** React, built with Vite. No full stack framework.
+- **API:** Fastify on EC2.
+- **Database:** `pg` with plain SQL and no ORM. PGLite stands in for Postgres in tests.
+- **GitHub:** `@octokit/auth-app` creates installation tokens, and the API is called with `fetch`.
+
 **Modules**
 
-The sketches below use TypeScript notation, but the language is not chosen yet.
+These are sketches of each module's interface.
 
 ```ts
 // MVP reader
@@ -97,12 +125,8 @@ interface RepoSource {
 interface Llm { complete(prompt: string): Promise<string> }
 assess(plan, files, llm): Promise<Assessment>   // rejects bad responses
 
-// Runs in Lambda, with no database access
-analyze(repo, llm): Promise<{ plan, assessment } | Failure>
-
-// Runs on EC2, and calls the Lambda through this port
-interface Analyzer { run(): Promise<{ plan, assessment } | Failure> }
-runComparison({ analyzer, store, now }): Promise<void>
+// Runs on EC2, in the background after the button is pressed
+runComparison({ repo, llm, store, now }): Promise<void>
 
 // Results store
 savePlan(planOrProblems, now)
@@ -112,20 +136,19 @@ fail(runId, reason, now)
 view(now): { plan, latest: Snapshot | null, state: "idle" | "running" | { failed: reason } }
 
 // Timeline page
-buildTimeline(view, today): TimelineModel       // pure; the page only renders this
+buildTimeline(view, today): TimelineModel       // pure; runs in the browser
 
 // Sign-in
 admit(githubUserId): boolean
 ```
 
 - **MVP reader (`parsePlan`):** turns `MVP.md` into deliverables with deadlines and done criteria, and reports what's missing or malformed.
-- **GitHub access (`RepoSource`):** the only module that calls GitHub's API for repo contents. It hides fetching and pagination, and has a GitHub adapter and a fake for tests. Lambda uses `read` for the code. EC2 uses `readPlanFile` on reload.
+- **GitHub access (`RepoSource`):** the only module that calls GitHub's API for repo contents. It hides tokens, fetching and pagination, and has a GitHub adapter and a fake for tests. `readPlanFile` serves page reloads, and `read` serves comparisons.
 - **Comparison (`assess`):** takes the plan and code, chooses what to send, excludes secrets, asks the LLM, and validates the response. The LLM must give a verdict on every done criterion: met, or not met with tasks. A missing or unknown criterion, an unknown deliverable, or a not-met criterion with no tasks is a failed comparison. `assess` works out "done" itself, so a skipped deliverable can't be marked finished.
-- **`analyze`:** reads the repo, parses the plan, runs `assess`, and returns the result. The Lambda handler only builds its dependencies and calls this.
-- **`runComparison`:** owns the order of steps on EC2 and turns failures into stored states.
-- **Results store (`RunStore`):** the only module that talks to RDS. It saves the current plan and the latest run. `start` is atomic, so a double press can't start two runs. A run still "running" after the Lambda timeout counts as failed, so a crash can't block the button forever. A successful run saves its plan with its results.
-- **Timeline page:** renders `buildTimeline`'s output, matching the mockup.
-- **Sign-in (`admit`):** handles GitHub sign-in and rejects every account but mine, by numeric GitHub user ID because usernames can change and be reclaimed. It's separate from repo access, which uses a different credential.
+- **`runComparison`:** reads the repo, parses the plan, runs `assess`, and saves the result or the failure. It owns the order of steps and turns failures into stored states.
+- **Results store (`RunStore`):** the only module that talks to RDS. It saves the current plan and the latest run. `start` is atomic, so a double press can't start two runs. A run still "running" past a time limit counts as failed, as does any run left "running" when the server starts, so a crash can't block the button forever. A successful run saves its plan with its results.
+- **Timeline page:** renders `buildTimeline`'s output, matching the mockup. `buildTimeline` runs in the browser so "today" and days left use my local date.
+- **Sign-in (`admit`):** handles GitHub sign-in and rejects every account but mine, by numeric GitHub user ID because usernames can change and be reclaimed.
 
 **Decisions made**
 
@@ -133,13 +156,9 @@ admit(githubUserId): boolean
 - `MVP.md` sits at the repo root. The app never writes it.
 - The comparison runs only on a button press.
 - GitHub is read-only. The app ignores GitHub's milestones and Projects.
-- **Where each part runs:**
-  - **EC2:** holds the GitHub App's private key, handles sign-in, creates short-lived repo tokens, reads `MVP.md` on reload, and is the only thing that talks to RDS.
-  - **Lambda:** receives a token from EC2, reads the repo's code, calls the LLM, and returns the result. It must never log the token. It runs outside a VPC, so it needs no NAT gateway to reach GitHub or the LLM.
-  - **RDS:** stays private and accepts connections only from EC2.
-- **Starting a comparison:** the button returns immediately, EC2 waits on the Lambda in the background, and the page polls for the run's state. Only EC2 can invoke the Lambda, through IAM, and the Lambda has no public URL. AWS SDK retries are off for this call, and its timeout is longer than the Lambda's, so a slow run can't be retried and charged twice. If EC2 restarts mid-run, that result is lost and the run counts as failed once the timeout passes.
-- **Refreshing the plan:** after sign-in, every reload reads `MVP.md` directly from EC2, with no Lambda or LLM call. A comparison saves the plan it used along with its results. There is no refresh button. A signed-out visitor can't trigger a GitHub read.
-- **GitHub App:** a registration on GitHub plus credentials, not a separately hosted service, so no extra host is needed. Sign-in uses a user token and repo reads use an installation token, and both call GitHub's API. Webhooks are off because comparisons only run on a button press. It's limited to the chosen repo with read-only Contents access. That limit rests on memory of GitHub's permission model, so confirm it during deliverable 1.
+- **Starting a comparison:** the API returns immediately, EC2 runs the comparison in the background, and the page polls for the run's state. If EC2 restarts mid-run, that run counts as failed, and earlier results stay in place.
+- **Refreshing the plan:** after sign-in, every reload reads `MVP.md` from EC2, with no LLM call. A comparison saves the plan it used along with its results. There is no refresh button. A signed-out visitor can't trigger a GitHub read.
+- **GitHub App:** a registration on GitHub plus credentials, not a separately hosted service. Sign-in uses a user token and repo reads use an installation token, and both call GitHub's API. Webhooks are off because comparisons only run on a button press. It's installed only on the tracked repo with read-only Contents access, which was confirmed on 2026-11-05: it could read this repo, couldn't read another private repo, and couldn't write.
 - **Theme:** the page uses GitHub's light and dark colors and system fonts, and follows the device's setting with no toggle. Status icons follow GitHub's issue style: a hollow green circle for open, a filled purple check for done, and a dashed gray circle for not compared yet.
 - **Compare button:** it's disabled when `MVP.md` is missing or invalid, because a run couldn't succeed.
 - **Done criteria are checkable from the repo:** the comparison only sees files, so anything set up outside the code, such as billing alerts or GitHub App settings, is recorded in a doc in the repo.
@@ -149,7 +168,6 @@ admit(githubUserId): boolean
 - **The exact format of `MVP.md`:** deliverable, deadline, and done criteria are required. This repo's `MVP.md` uses a draft format, to be settled when the MVP reader is built in deliverable 2.
 - **Which LLM to use:** its cost was not part of the research.
 - **How much code to send to the LLM:** a repo may not fit in one request, and secrets must not be sent.
-- **Which language to use:** the interfaces above are only sketches.
 
 ## Testing Decisions
 
@@ -157,13 +175,13 @@ admit(githubUserId): boolean
 - The main seam is the comparison: given a plan and a set of code files, with a fake LLM, `assess` returns a verdict for every criterion and tasks grouped by deliverable. It's also tested for failed and malformed LLM responses, a response that skips a criterion, and a secret file never reaching the prompt.
 - The MVP reader is tested directly with valid, incomplete, and malformed files.
 - Sign-in is tested for one thing that matters most: any account but mine is refused.
-- `runComparison` is tested with a fake `Analyzer` and a real store on a local Postgres stand-in, to show a failed comparison leaves earlier results in place and a double press can't start a second run.
+- `runComparison` is tested with a fake `RepoSource`, a fake LLM and a real store on PGLite, to show a failed comparison leaves earlier results in place and a double press can't start a second run.
 - `buildTimeline` is tested directly for days left, overdue deliverables, and done versus open.
 - AWS wiring is checked by running deliverable 1 for real, since working through that is the point.
-- There is no prior art, because this is a new repo.
 
 ## Out of Scope
 
+- Lambda (dropped on 2026-11-07; a possible later home for the comparison, so a server restart can't lose a run)
 - `.yaml` config (possibly useful later for files to leave out of LLM prompts)
 - Scheduled checks and warnings
 - Other users
@@ -183,19 +201,21 @@ admit(githubUserId): boolean
 
 | # | Deliverable | Due |
 |---|---|---|
-| 1 | AWS path: a Lambda reads the repo from GitHub through the GitHub App, and EC2 saves a row in RDS | 2026-11-07 |
-| 2 | Comparison: the Lambda reads `MVP.md` and the code and asks an LLM what's left, and EC2 saves the tasks by deliverable | 2026-11-14 |
-| 3 | Timeline page: hosted on EC2, reading from RDS, and refreshing the plan on reload | 2026-11-21 |
+| 1 | AWS path: EC2 reads the repo from GitHub through the GitHub App and saves a row in RDS | 2026-11-10 |
+| 2 | Comparison: EC2 reads `MVP.md` and the code, asks an LLM what's left, and saves the tasks by deliverable | 2026-11-14 |
+| 3 | Timeline page: the React app on S3 and CloudFront, reading from the EC2 API, on my domain over HTTPS | 2026-11-21 |
 | 4 | GitHub sign-in: user sign-in through the GitHub App, limited to my account | 2026-11-27 |
 | 5 | One real project: I run a real project through it | 2026-11-28 |
 
 Done criteria for each deliverable are in `MVP.md`.
 
-**Finish line:** the Lambda, EC2, and RDS goals are met, and the tool is usable for myself. Showing it to others is optional.
+**Finish line:** the EC2, RDS, S3 and CloudFront goals are met, and the tool is usable for myself. Showing it to others is optional.
 
-**Cost:** research estimated about $24.40/month after credits in us-east-1 for the EC2, RDS, storage, and public IP, excluding LLM calls. This design needs no NAT gateway or public database, so the $60.90 and $28.05 options researched earlier no longer apply, but the $24.40 estimate should be rechecked. New AWS accounts get limited credits rather than a 12-month free allowance. RDS keeps billing until it's deleted, and restarts itself after 7 days if stopped.
+**Cost:** research estimated about $24.40/month after credits in us-east-1 for the EC2, RDS, storage, and public IP, excluding LLM calls. S3 and CloudFront should add very little at one user's traffic, and a domain adds its yearly fee. There's no NAT gateway, so recheck the estimate once everything is running. New AWS accounts get limited credits rather than a 12-month free allowance. RDS keeps billing until it's deleted, and restarts itself after 7 days if stopped.
 
-**What this design gives up:** with the Lambda outside a VPC, I won't learn how to run a Lambda inside a private network. I accepted this to avoid the NAT gateway and a public database.
+**What this design gives up:**
+- **Lambda:** I won't learn Lambda in this project, which was part of the original motive.
+- **Comparisons depend on the server:** they run inside the EC2 process, so a restart mid-run loses that run.
 
 **References**
 
