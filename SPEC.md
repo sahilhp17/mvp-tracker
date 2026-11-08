@@ -10,7 +10,7 @@ I also want to learn AWS by building something real. I can't yet run a server on
 
 ## Solution
 
-I write an `MVP.md` in a repo, listing deliverables with a deadline and done criteria for each. I sign in with GitHub and open a page showing those deliverables on a timeline. The page refreshes the plan from `MVP.md` on every reload, before any comparison has run. When I press "Compare with code", an LLM compares `MVP.md` with the repo's code and lists the tasks left, grouped by deliverable and tied to done criteria. Results are saved, so they're still there when I come back.
+I write an `MVP.md` in a repo, listing deliverables with a deadline and done criteria for each. I sign in with GitHub and open a page showing those deliverables on a timeline. The page refreshes the MVP from `MVP.md` on every reload, before any comparison has run. When I press "Compare with code", an LLM compares `MVP.md` with the repo's code and lists the tasks left, grouped by deliverable and tied to done criteria. Results are saved, so they're still there when I come back.
 
 The React frontend is served from S3 through CloudFront, the API runs on EC2, and data is stored in RDS. Learning these services is the main reason for building it, so a cheaper stack isn't the goal.
 
@@ -65,12 +65,12 @@ The React frontend is served from S3 through CloudFront, the API runs on EC2, an
 33. As the user, I want to store repo data and results in RDS, so that I learn how to run a database on AWS.
 34. As the user, I want billing alerts in place from the start, so that a mistake doesn't turn into a surprise bill.
 
-**Keeping the plan current**
+**Keeping the MVP current**
 
-35. As the user, I want the page to refresh the plan from `MVP.md` on every reload, so that the timeline matches the file without an LLM call.
+35. As the user, I want the page to refresh the MVP from `MVP.md` on every reload, so that the timeline matches the file without an LLM call.
 36. As the user, I want to see my deliverables before the first comparison, so that the timeline is useful right away.
-37. As the user, I want to see the saved plan and a notice when GitHub can't be reached, so that a GitHub outage doesn't blank the page.
-38. As the user, I want to keep seeing my last valid plan when `MVP.md` becomes invalid, so that a typo doesn't hide my project.
+37. As the user, I want to see the saved MVP and a notice when GitHub can't be reached, so that a GitHub outage doesn't blank the page.
+38. As the user, I want to keep seeing my last valid MVP when `MVP.md` becomes invalid, so that a typo doesn't hide my project.
 39. As the user, I want a notice when `MVP.md` has changed since the last comparison, so that I know the tasks may be out of date.
 
 **Theme**
@@ -113,27 +113,27 @@ These are sketches of each module's interface.
 
 ```ts
 // MVP reader
-parsePlan(markdown): Plan | { problems: Problem[] }
+parseMvp(content): Mvp | { problems: Problem[] }
 
 // GitHub access
 interface RepoSource {
-  readPlanFile(): Promise<string | null>   // null if there's no MVP.md
+  readMvpFile(): Promise<string | null>   // null if there's no MVP.md
   read(): Promise<RepoFile[]>
 }
 
 // Comparison
 interface Llm { complete(prompt: string): Promise<string> }
-assess(plan, files, llm): Promise<Assessment>   // rejects bad responses
+assess(mvp, files, llm): Promise<Assessment>   // rejects bad responses
 
 // Runs on EC2, in the background after the button is pressed
 runComparison({ repo, llm, store, now }): Promise<void>
 
 // Results store
-savePlan(planOrProblems, now)
-start(now): RunId | AlreadyRunning
-succeed(runId, plan, assessment, now)
-fail(runId, reason, now)
-view(now): { plan, latest: Snapshot | null, state: "idle" | "running" | { failed: reason } }
+saveMvp(content, now): MvpId
+start(mvpId, now): ComparisonId | AlreadyRunning
+succeed(comparisonId, result: Assessment, now)
+fail(comparisonId, reason, now)
+view(now): { mvp, latest: Snapshot | null, state: "idle" | "running" | { failed: reason } }
 
 // Timeline page
 buildTimeline(view, today): TimelineModel       // pure; runs in the browser
@@ -142,11 +142,25 @@ buildTimeline(view, today): TimelineModel       // pure; runs in the browser
 admit(githubUserId): boolean
 ```
 
-- **MVP reader (`parsePlan`):** turns `MVP.md` into deliverables with deadlines and done criteria, and reports what's missing or malformed.
-- **GitHub access (`RepoSource`):** the only module that calls GitHub's API for repo contents. It hides tokens, fetching and pagination, and has a GitHub adapter and a fake for tests. `readPlanFile` serves page reloads, and `read` serves comparisons.
-- **Comparison (`assess`):** takes the plan and code, chooses what to send, excludes secrets, asks the LLM, and validates the response. The LLM must give a verdict on every done criterion: met, or not met with tasks. A missing or unknown criterion, an unknown deliverable, or a not-met criterion with no tasks is a failed comparison. `assess` works out "done" itself, so a skipped deliverable can't be marked finished.
-- **`runComparison`:** reads the repo, parses the plan, runs `assess`, and saves the result or the failure. It owns the order of steps and turns failures into stored states.
-- **Results store (`RunStore`):** the only module that talks to RDS. It saves the current plan and the latest run. `start` is atomic, so a double press can't start two runs. A run still "running" past a time limit counts as failed, as does any run left "running" when the server starts, so a crash can't block the button forever. A successful run saves its plan with its results.
+- **MVP reader (`parseMvp`):** turns `MVP.md` into deliverables with deadlines and done criteria, and reports what's missing or malformed. Deliverables and criteria get IDs by position (`d1`, `d1.c1`), so the same file always parses the same way.
+- **GitHub access (`RepoSource`):** the only module that calls GitHub's API for repo contents. It hides tokens, fetching and pagination, and has a GitHub adapter and a fake for tests. `readMvpFile` serves page reloads, and `read` serves comparisons.
+- **Comparison (`assess`):** takes the MVP and code, chooses what to send, excludes secrets, asks the LLM, and validates the response. The LLM must give a verdict on every done criterion: met, or not met with tasks. A missing or unknown criterion, an unknown deliverable, or a not-met criterion with no tasks is a failed comparison. `assess` works out "done" itself, so a skipped deliverable can't be marked finished.
+- **`runComparison`:** reads and saves `MVP.md`, starts a comparison against it, reads the code, runs `assess`, and saves the result or the failure. It owns the order of steps and turns failures into stored states.
+- **Results store (`ResultsStore`):** the only module that talks to RDS. `saveMvp` stores each distinct version of `MVP.md` once. `start` is atomic, so a double press can't start two comparisons. A comparison still "running" past a time limit counts as failed, as does any comparison left "running" when the server starts, so a crash can't block the button forever. The page shows the latest succeeded comparison, so a failure never replaces earlier results. The last valid MVP is the newest stored version that parses.
+
+**Database schema**
+
+The schema is in `backend/db/001_init.sql`.
+
+| Table | One row per | Columns |
+|---|---|---|
+| `mvp` | Distinct version of `MVP.md` | `content` (the file as read), `content_hash` (unique sha256), `first_seen_at`, `last_seen_at` |
+| `comparisons` | Press of Compare with code | `status` (`running`, `succeeded` or `failed`), `mvp_id` (the version compared), `result` (the validated AI response, as JSONB), `failure`, `started_at`, `finished_at` |
+
+- **Nothing parsed is stored:** the server parses `content` when it reads it. Parsing is quick and gives the same result for the same file, so the file is the only source of truth.
+- **One running comparison at a time:** a partial unique index on `comparisons` where `status = 'running'` makes a second start fail.
+- **The MVP-changed notice:** it appears when the newest `mvp` row differs from the one the latest succeeded comparison used.
+- **`result` is JSONB, not separate tables:** the app always reads and writes a whole result at once, and `assess` checks its shape.
 - **Timeline page:** renders `buildTimeline`'s output, matching the mockup. `buildTimeline` runs in the browser so "today" and days left use my local date.
 - **Sign-in (`admit`):** handles GitHub sign-in and rejects every account but mine, by numeric GitHub user ID because usernames can change and be reclaimed.
 
@@ -157,7 +171,7 @@ admit(githubUserId): boolean
 - The comparison runs only on a button press.
 - GitHub is read-only. The app ignores GitHub's milestones and Projects.
 - **Starting a comparison:** the API returns immediately, EC2 runs the comparison in the background, and the page polls for the run's state. If EC2 restarts mid-run, that run counts as failed, and earlier results stay in place.
-- **Refreshing the plan:** after sign-in, every reload reads `MVP.md` from EC2, with no LLM call. A comparison saves the plan it used along with its results. There is no refresh button. A signed-out visitor can't trigger a GitHub read.
+- **Refreshing the MVP:** after sign-in, every reload reads `MVP.md` from EC2 and saves it if it changed, with no LLM call. Each comparison records which version of `MVP.md` it used. There is no refresh button. A signed-out visitor can't trigger a GitHub read.
 - **GitHub App:** a registration on GitHub plus credentials, not a separately hosted service. Sign-in uses a user token and repo reads use an installation token, and both call GitHub's API. Webhooks are off because comparisons only run on a button press. It's installed only on the tracked repo with read-only Contents access, which was confirmed on 2026-11-05: it could read this repo, couldn't read another private repo, and couldn't write.
 - **Theme:** the page uses GitHub's light and dark colors and system fonts, and follows the device's setting with no toggle. Status icons follow GitHub's issue style: a hollow green circle for open, a filled purple check for done, and a dashed gray circle for not compared yet.
 - **Compare button:** it's disabled when `MVP.md` is missing or invalid, because a run couldn't succeed.
@@ -172,7 +186,7 @@ admit(githubUserId): boolean
 ## Testing Decisions
 
 - A good test checks external behavior, not implementation details. Tests should still pass after an internal rewrite.
-- The main seam is the comparison: given a plan and a set of code files, with a fake LLM, `assess` returns a verdict for every criterion and tasks grouped by deliverable. It's also tested for failed and malformed LLM responses, a response that skips a criterion, and a secret file never reaching the prompt.
+- The main seam is the comparison: given an MVP and a set of code files, with a fake LLM, `assess` returns a verdict for every criterion and tasks grouped by deliverable. It's also tested for failed and malformed LLM responses, a response that skips a criterion, and a secret file never reaching the prompt.
 - The MVP reader is tested directly with valid, incomplete, and malformed files.
 - Sign-in is tested for one thing that matters most: any account but mine is refused.
 - `runComparison` is tested with a fake `RepoSource`, a fake LLM and a real store on PGLite, to show a failed comparison leaves earlier results in place and a double press can't start a second run.
