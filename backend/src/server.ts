@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { getMVP } from './github';
 import { saveMvp } from './db';
 
-export const server = Fastify().withTypeProvider<ZodTypeProvider>()
+export const server = Fastify({logger: true}).withTypeProvider<ZodTypeProvider>()
                         .setValidatorCompiler(validatorCompiler)
                         .setSerializerCompiler(serializerCompiler);
     
