@@ -2,6 +2,7 @@ import Fastify from 'fastify'
 import {ZodTypeProvider, serializerCompiler, validatorCompiler} from '@fastify/type-provider-zod'
 import { z } from 'zod'
 import { getMVP } from './github';
+import { saveMvp } from './db';
 
 export const server = Fastify().withTypeProvider<ZodTypeProvider>()
                         .setValidatorCompiler(validatorCompiler)
@@ -19,10 +20,11 @@ server.get('/mvp', async (request, reply) =>  {
             return reply.code(404)
                 .send({response: 'Cannot find MVP.md in remote repository'})
         }
-        return {mvp}
+        const id = await saveMvp(mvp);
+        return {mvp, id}
     } catch (err) {
         request.log.error(err)
-        return reply.code(502).send({error: "Couldn't reach Github"})
+        return reply.code(500).send({error: "Server error"})
     }
 })
 

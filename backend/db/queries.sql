@@ -68,3 +68,5 @@ limit 1;
 select status, failure, started_at, mvp_id from comparisons
 order by started_at desc
 limit 1;
+
+insert into mvp (content, content_hash) values ('test', 'test') returning id;
