@@ -10,7 +10,7 @@ I also want to learn AWS by building something real. I can't yet run a server on
 
 ## Solution
 
-I write an `MVP.md` in a repo, listing deliverables with a deadline and done criteria for each. I sign in with GitHub and open a page showing those deliverables on a timeline. The page refreshes the MVP from `MVP.md` on every reload, before any comparison has run. When I press "Compare with code", an LLM compares `MVP.md` with the repo's code and lists the tasks left, grouped by deliverable and tied to done criteria. Results are saved, so they're still there when I come back.
+I write an `MVP.md` in a repo, listing deliverables with a deadline and done criteria for each. I sign in with GitHub and open a page showing those deliverables on a timeline. The page refreshes the MVP from `MVP.md` on every reload, before any comparison has run. An LLM reads the file and works out the deliverables, deadlines and done criteria, once for each version of the file. When I press "Compare with code", an LLM compares `MVP.md` with the repo's code and lists the tasks left, grouped by deliverable and tied to done criteria. Results are saved, so they're still there when I come back.
 
 The React frontend is served from S3 through CloudFront, the API runs on EC2, and data is stored in RDS. Learning these services is the main reason for building it, so a cheaper stack isn't the goal.
 
@@ -67,7 +67,7 @@ The React frontend is served from S3 through CloudFront, the API runs on EC2, an
 
 **Keeping the MVP current**
 
-35. As the user, I want the page to refresh the MVP from `MVP.md` on every reload, so that the timeline matches the file without an LLM call.
+35. As the user, I want the page to refresh the MVP from `MVP.md` on every reload, so that the timeline matches the file, with an LLM call only when the file has changed.
 36. As the user, I want to see my deliverables before the first comparison, so that the timeline is useful right away.
 37. As the user, I want to see the saved MVP and a notice when GitHub can't be reached, so that a GitHub outage doesn't blank the page.
 38. As the user, I want to keep seeing my last valid MVP when `MVP.md` becomes invalid, so that a typo doesn't hide my project.
@@ -86,18 +86,19 @@ Browser ──HTTPS──▶ CloudFront (your domain, free HTTPS certificate)
                      ├─ /*      ──▶ S3 (built React files, private bucket)
                      └─ /api/*  ──▶ EC2 (Fastify API)
 
-┌──────────────────────── VPC ─────────────────────────────┐
-│  Public subnet:   EC2 ──▶ internet gateway ──▶ GitHub, LLM │
-│                    │                                       │
-│  Private subnet:  RDS ◀── only EC2 can connect             │
-└───────────────────────────────────────────────────────────┘
+┌───────────────────────────── VPC ──────────────────────────────┐
+│  Public subnet:   EC2 ──▶ internet gateway ──▶ GitHub, Bedrock │
+│                    │                                           │
+│  Private subnet:  RDS ◀── only EC2 can connect                 │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 - **CloudFront:** serves the site on my domain over HTTPS. It sends `/api/*` to EC2 and everything else to S3, so the page and API share one domain and sign-in cookies work without cross-origin setup. It never caches `/api/*`, and gives `index.html` a short cache time so new deployments show straight away.
 - **S3:** a private bucket holding the built React app, readable only through CloudFront.
 - **EC2:** runs the Fastify API in a public subnet. It reaches GitHub and the LLM through the VPC's internet gateway, so no NAT gateway is needed. Its security group accepts API traffic only from CloudFront, using AWS's managed CloudFront prefix list. It holds the GitHub App's private key, handles sign-in, reads `MVP.md` on reload, runs comparisons, and is the only thing that talks to RDS.
 - **RDS:** Postgres in a private subnet of the same VPC. Its security group accepts connections only from EC2's security group.
-- **Secrets:** the GitHub App's private key and the LLM API key are stored in AWS Secrets Manager, and EC2 reads them through its IAM role. They're never committed.
+- **Secrets:** the GitHub App's private key is stored in AWS Secrets Manager, and EC2 reads it through its IAM role. It's never committed.
+- **LLM:** Claude on Amazon Bedrock. EC2 calls Bedrock with its IAM role, so there's no LLM API key to store.
 
 **Stack**
 
@@ -106,6 +107,7 @@ Browser ──HTTPS──▶ CloudFront (your domain, free HTTPS certificate)
 - **API:** Fastify on EC2.
 - **Database:** `pg` with plain SQL and no ORM. PGLite stands in for Postgres in tests.
 - **GitHub:** `@octokit/auth-app` creates installation tokens, and the API is called with `fetch`.
+- **LLM:** `@anthropic-ai/bedrock-sdk` calls Claude on Bedrock, behind the `Llm` interface. Every LLM call goes through that interface, so another provider (on Bedrock or elsewhere) only needs a new adapter.
 
 **Modules**
 
@@ -113,7 +115,7 @@ These are sketches of each module's interface.
 
 ```ts
 // MVP reader
-parseMvp(content): Mvp | { problems: Problem[] }
+extractMvp(content, llm): Promise<Mvp | { problems: Problem[] }>   // rejects bad responses
 
 // GitHub access
 interface RepoSource {
@@ -129,7 +131,7 @@ assess(mvp, files, llm): Promise<Assessment>   // rejects bad responses
 runComparison({ repo, llm, store, now }): Promise<void>
 
 // Results store
-saveMvp(content, now): MvpId
+saveMvp(content, extracted, now): MvpId
 start(mvpId, now): ComparisonId | AlreadyRunning
 succeed(comparisonId, result: Assessment, now)
 fail(comparisonId, reason, now)
@@ -142,22 +144,27 @@ buildTimeline(view, today): TimelineModel       // pure; runs in the browser
 admit(githubUserId): boolean
 ```
 
-- **MVP reader (`parseMvp`):** turns `MVP.md` into deliverables with deadlines and done criteria, and reports what's missing or malformed. Deliverables and criteria get IDs by position (`d1`, `d1.c1`), so the same file always parses the same way.
+- **MVP reader (`extractMvp`):** asks the LLM to turn `MVP.md` into deliverables with deadlines and done criteria, and to report anything missing, such as a deliverable with no deadline or no criteria. It checks the response's shape: every deliverable has a title, an ISO date and at least one criterion. An LLM may not extract the same file the same way twice, so each version is extracted once and the result is stored.
+  - **Criteria are copied word for word.** The LLM must copy each criterion's text exactly as it appears in the file, and `extractMvp` rejects any criterion whose text isn't in the file.
+  - **Each criterion's key is its text.** The key is a short hash of the criterion's own text, lowercased with whitespace collapsed. Position plays no part, so a criterion moved to another deliverable, or pushed into a newly added one, keeps its key, and inserting or reordering deliverables shifts nothing. A reworded criterion gets a new key, because its wording is what gets judged. Two criteria with the same text are reported as a problem, since they'd share a key.
+  - **Nested criteria.** Only bottom-level bullets are judged. A bullet with bullets under it is a label that groups them, and the extraction records each criterion's parent so the page can show the grouping. A parent's text isn't part of its children's keys, so a nested bullet moved under another bullet, to another deliverable or back to the top level keeps its key. Adding bullets under a criterion turns it into a label; moving them all away makes it a judged criterion again, with the same key.
+  - **Deliverables** are matched by title for display, and get display numbers by position.
 - **GitHub access (`RepoSource`):** the only module that calls GitHub's API for repo contents. It hides tokens, fetching and pagination, and has a GitHub adapter and a fake for tests. `readMvpFile` serves page reloads, and `read` serves comparisons.
-- **Comparison (`assess`):** takes the MVP and code, chooses what to send, excludes secrets, asks the LLM, and validates the response. The LLM must give a verdict on every done criterion: met, or not met with tasks. A missing or unknown criterion, an unknown deliverable, or a not-met criterion with no tasks is a failed comparison. `assess` works out "done" itself, so a skipped deliverable can't be marked finished.
-- **`runComparison`:** reads and saves `MVP.md`, starts a comparison against it, reads the code, runs `assess`, and saves the result or the failure. It owns the order of steps and turns failures into stored states.
-- **Results store (`ResultsStore`):** the only module that talks to RDS. `saveMvp` stores each distinct version of `MVP.md` once. `start` is atomic, so a double press can't start two comparisons. A comparison still "running" past a time limit counts as failed, as does any comparison left "running" when the server starts, so a crash can't block the button forever. The page shows the latest succeeded comparison, so a failure never replaces earlier results. The last valid MVP is the newest stored version that parses.
+- **Comparison (`assess`):** takes the MVP and code, chooses what to send, excludes secrets, asks the LLM, and validates the response. The LLM must give a verdict on every judged criterion: met, or not met with tasks. A missing or unknown criterion, or a not-met criterion with no tasks, is a failed comparison. Verdicts are stored by criterion key. `assess` works out "done" itself, so a skipped deliverable can't be marked finished.
+- **Showing results against a newer `MVP.md`:** the page shows only the latest succeeded comparison's verdicts, matched to the current version's criteria by key. A criterion that wasn't in that comparison (new, reworded, or a former label) shows "not compared yet", never an older verdict. A deliverable is done when every judged criterion it has now is met.
+- **`runComparison`:** reads and saves `MVP.md` (extracting it if it's a new version), starts a comparison against its stored extraction, reads the code, runs `assess`, and saves the result or the failure. It owns the order of steps and turns failures into stored states.
+- **Results store (`ResultsStore`):** the only module that talks to RDS. `saveMvp` stores each distinct version of `MVP.md` once, with its extraction. `start` is atomic, so a double press can't start two comparisons. A comparison still "running" past a time limit counts as failed, as does any comparison left "running" when the server starts, so a crash can't block the button forever. The page shows the latest succeeded comparison, so a failure never replaces earlier results. The last valid MVP is the newest stored version whose extraction has no problems.
 
 **Database schema**
 
-The schema is in `backend/db/001_init.sql`.
+The schema is in `backend/db/migrations/001_init.sql`.
 
 | Table | One row per | Columns |
 |---|---|---|
-| `mvp` | Distinct version of `MVP.md` | `content` (the file as read), `content_hash` (unique sha256), `first_seen_at`, `last_seen_at` |
-| `comparisons` | Press of Compare with code | `status` (`running`, `succeeded` or `failed`), `mvp_id` (the version compared), `result` (the validated AI response, as JSONB), `failure`, `started_at`, `finished_at` |
+| `mvp` | Distinct version of `MVP.md` | `content` (the file as read), `content_hash` (unique sha256), `extracted` (the validated LLM extraction or its problems, as JSONB; null until extraction succeeds), `first_seen_at`, `last_seen_at` |
+| `comparisons` | Press of Compare with code | `status` (`running`, `succeeded` or `failed`), `mvp_id` (the version compared), `result` (the validated AI response as JSONB, with verdicts keyed by criterion key), `failure`, `started_at`, `finished_at` |
 
-- **Nothing parsed is stored:** the server parses `content` when it reads it. Parsing is quick and gives the same result for the same file, so the file is the only source of truth.
+- **The extraction is stored per version:** an LLM extraction is slow, costs money, and can differ between runs, so each version is extracted once, when it's first seen. The file is still the source of truth, and `extracted` is a cache keyed by `content_hash`. If extraction fails (for example, the LLM can't be reached), `extracted` stays null, the page keeps the last valid MVP, and the next reload tries again.
 - **One running comparison at a time:** a partial unique index on `comparisons` where `status = 'running'` makes a second start fail.
 - **The MVP-changed notice:** it appears when the newest `mvp` row differs from the one the latest succeeded comparison used.
 - **`result` is JSONB, not separate tables:** the app always reads and writes a whole result at once, and `assess` checks its shape.
@@ -171,23 +178,23 @@ The schema is in `backend/db/001_init.sql`.
 - The comparison runs only on a button press.
 - GitHub is read-only. The app ignores GitHub's milestones and Projects.
 - **Starting a comparison:** the API returns immediately, EC2 runs the comparison in the background, and the page polls for the run's state. If EC2 restarts mid-run, that run counts as failed, and earlier results stay in place.
-- **Refreshing the MVP:** after sign-in, every reload reads `MVP.md` from EC2 and saves it if it changed, with no LLM call. Each comparison records which version of `MVP.md` it used. There is no refresh button. A signed-out visitor can't trigger a GitHub read.
+- **Refreshing the MVP:** after sign-in, every reload reads `MVP.md` from EC2. A new version is extracted by the LLM and saved. An unchanged file uses the stored extraction, with no LLM call. Each comparison records which version of `MVP.md` it used. There is no refresh button. A signed-out visitor can't trigger a GitHub read.
 - **GitHub App:** a registration on GitHub plus credentials, not a separately hosted service. Sign-in uses a user token and repo reads use an installation token, and both call GitHub's API. Webhooks are off because comparisons only run on a button press. It's installed only on the tracked repo with read-only Contents access, which was confirmed on 2026-11-05: it could read this repo, couldn't read another private repo, and couldn't write.
 - **Theme:** the page uses GitHub's light and dark colors and system fonts, and follows the device's setting with no toggle. Status icons follow GitHub's issue style: a hollow green circle for open, a filled purple check for done, and a dashed gray circle for not compared yet.
-- **Compare button:** it's disabled when `MVP.md` is missing or invalid, because a run couldn't succeed.
+- **Compare button:** it's disabled when `MVP.md` is missing or invalid, or while a new version is being extracted, because a run couldn't succeed yet.
+- **`MVP.md` format:** free-form, because the LLM works out the structure. The recommended style, described in a comment at the end of this repo's `MVP.md`, is one `## YYYY-MM-DD · Title` heading per deliverable in date order, with one bullet per done criterion. It keeps extraction reliable, but other layouts work too. The file holds the plan only: whether a criterion is met comes from comparisons, not from the file.
 - **Done criteria are checkable from the repo:** the comparison only sees files, so anything set up outside the code, such as billing alerts or GitHub App settings, is recorded in a doc in the repo.
 
 **Still to decide**
 
-- **The exact format of `MVP.md`:** deliverable, deadline, and done criteria are required. This repo's `MVP.md` uses a draft format, to be settled when the MVP reader is built in deliverable 2.
-- **Which LLM to use:** its cost was not part of the research.
+- **Which Claude model to use:** Claude on Bedrock is decided; the model and its cost per comparison weren't part of the research.
 - **How much code to send to the LLM:** a repo may not fit in one request, and secrets must not be sent.
 
 ## Testing Decisions
 
 - A good test checks external behavior, not implementation details. Tests should still pass after an internal rewrite.
 - The main seam is the comparison: given an MVP and a set of code files, with a fake LLM, `assess` returns a verdict for every criterion and tasks grouped by deliverable. It's also tested for failed and malformed LLM responses, a response that skips a criterion, and a secret file never reaching the prompt.
-- The MVP reader is tested directly with valid, incomplete, and malformed files.
+- The MVP reader is tested with a fake LLM: a valid extraction, one that reports a missing deadline or missing criteria, and a malformed response. It's also tested to show an unchanged file isn't extracted again, a criterion moved to another deliverable keeps its key, a reworded one gets a new key, a bullet that gains sub-bullets becomes a label, and paraphrased or duplicate criteria are rejected.
 - Sign-in is tested for one thing that matters most: any account but mine is refused.
 - `runComparison` is tested with a fake `RepoSource`, a fake LLM and a real store on PGLite, to show a failed comparison leaves earlier results in place and a double press can't start a second run.
 - `buildTimeline` is tested directly for days left, overdue deliverables, and done versus open.

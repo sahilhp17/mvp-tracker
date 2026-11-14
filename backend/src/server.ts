@@ -16,7 +16,7 @@ server.get('/mvp', async (request, reply) =>  {
     try {
         const mvp = await getMVP();
         if (mvp == null) {
-            reply.code(404)
+            return reply.code(404)
                 .send({response: 'Cannot find MVP.md in remote repository'})
         }
         return {mvp}

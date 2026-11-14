@@ -33,6 +33,26 @@ where id = '2' and status = 'running'
 returning id;
 end;
 
+/* save the extraction once it succeeds (or the problems it found) */
+update mvp set extracted = '{
+  "deliverables": [],
+  "problems": []
+}'
+where id = 1 and extracted is null
+returning id;
+
+/* versions still waiting for extraction (it failed or hasn't run) */
+select id from mvp
+where extracted is null
+order by last_seen_at desc;
+
+/* the last valid MVP: newest version extracted with no problems */
+select * from mvp
+where extracted is not null
+  and jsonb_array_length(coalesce(extracted->'problems', '[]'::jsonb)) = 0
+order by last_seen_at desc
+limit 1;
+
 /* the newest MVP */
 select * from mvp
 order by last_seen_at desc

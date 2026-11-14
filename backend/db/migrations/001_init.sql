@@ -13,7 +13,7 @@ create table comparisons (
   id          bigint generated always as identity primary key,
   status      text        not null check (status in ('running', 'succeeded', 'failed')),
   mvp_id      bigint      not null references mvp(id),  -- the MVP this comparison used
-  result      jsonb,                                    -- the validated AI response, on success
+  result      jsonb,                                    -- the validated AI response, on success; verdicts keyed by criterion key
   failure     text,                                     -- what went wrong, on failure
   started_at  timestamptz not null default now(),
   finished_at timestamptz,
