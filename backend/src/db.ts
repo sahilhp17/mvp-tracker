@@ -9,7 +9,7 @@ const secret = JSON.parse(secretString ?? '{}') as { username: string; password:
 const pg = new SQL({
     hostname: process.env.RDS_HOST,
     port: 5432,
-    database: 'postgres',
+    database: 'mvp-tracker',
     username: secret.username,
     password: secret.password,
     tls: true
